@@ -1,0 +1,31 @@
+{
+    "name": "hulma-core",
+    "version": "0.1.0",
+    "description": "Math, geometry, meshes and rendering for hulma.",
+    "license": "UNLICENSED",
+    "private": true,
+    "type": "module",
+    "sideEffects": false,
+    "main": "./dist/index.js",
+    "types": "./dist/index.d.ts",
+    "exports": {
+        ".": {
+            "types": "./dist/index.d.ts",
+            "import": "./dist/index.js"
+        }
+    },
+    "scripts": {
+        "typecheck": "tsc --noEmit -p .",
+        "check:dist": "node scripts/assert-dist-has-no-alias.mjs",
+        "build": "npm run typecheck && tsdown --minify && npm run check:dist",
+        "build:local": "npm run typecheck && tsdown --sourcemap && npm run check:dist && npm run copy",
+        "copy": "node scripts/copy-to-client.mjs",
+        "test": "vitest run"
+    },
+    "devDependencies": {
+        "tsdown": "~0.23.1",
+        "typescript": "~6.0.2",
+        "vite": "~8.3.4",
+        "vitest": "~5.0.5"
+    }
+}

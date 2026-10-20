@@ -1,0 +1,21 @@
+{
+    "compilerOptions": {
+        "target": "ES2022",
+        "module": "ESNext",
+        "moduleResolution": "bundler",
+        "lib": ["ES2022", "DOM", "DOM.Iterable"],
+        "strict": true,
+        "noImplicitOverride": true,
+        "noImplicitReturns": true,
+        "noFallthroughCasesInSwitch": true,
+        "isolatedModules": true,
+        "skipLibCheck": true,
+        "declaration": true,
+        "noEmit": true,
+        "types": ["vitest/globals"],
+        "paths": {
+            "@core/*": ["./src/*"]
+        }
+    },
+    "include": ["src"]
+}
