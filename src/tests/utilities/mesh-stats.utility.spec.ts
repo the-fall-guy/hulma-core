@@ -58,6 +58,30 @@ describe('mesh stats utility', () => {
         expect(countUniquePoints([NaN, 0, 0, NaN, 0, 0, 1, 2, 3, 1, 2, 3])).toBe(3);
     });
 
+    it('keeps count of thousands of positions that differ in one coordinate only', () => {
+        for (const axis of [0, 1, 2]) {
+            const line: number[] = [];
+            for (let step = 0; step < 3000; step++) {
+                const position = [7, 8, 9];
+                position[axis] = step * 0.001;
+                line.push(...position);
+            }
+
+            expect(countUniquePoints(line), `axis ${axis}`).toBe(3000);
+            expect(countUniquePoints([...line, ...line]), `axis ${axis}, twice`).toBe(3000);
+        }
+    });
+
+    it('counts a hundred thousand NaN positions without slowing down', () => {
+        const positions = new Float32Array(300000).fill(NaN);
+        const startedAt = performance.now();
+
+        const count = countUniquePoints(positions);
+
+        expect(count).toBe(100000);
+        expect(performance.now() - startedAt).toBeLessThan(1000);
+    });
+
     it('ignores a trailing incomplete position', () => {
         expect(countUniquePoints([1, 2, 3, 4, 5])).toBe(1);
     });

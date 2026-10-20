@@ -1,3 +1,4 @@
+import type {AssetContainer} from '@babylonjs/core/assetContainer';
 import type {ArcRotateCamera} from '@babylonjs/core/Cameras/arcRotateCamera';
 import {PickingInfo} from '@babylonjs/core/Collisions/pickingInfo';
 import * as engineModule from '@babylonjs/core/Engines/engine';
@@ -6,21 +7,30 @@ import {PointerEventTypes, PointerInfo} from '@babylonjs/core/Events/pointerEven
 import {SelectionOutlineLayer} from '@babylonjs/core/Layers/selectionOutlineLayer';
 import {DirectionalLight} from '@babylonjs/core/Lights/directionalLight';
 import {HemisphericLight} from '@babylonjs/core/Lights/hemisphericLight';
+import {LoadAssetContainerAsync} from '@babylonjs/core/Loading/sceneLoader';
+import {MultiMaterial} from '@babylonjs/core/Materials/multiMaterial';
 import {PBRMaterial} from '@babylonjs/core/Materials/PBR/pbrMaterial';
 import {StandardMaterial} from '@babylonjs/core/Materials/standardMaterial';
 import * as hdrCubeTextureModule from '@babylonjs/core/Materials/Textures/hdrCubeTexture';
+import {Texture} from '@babylonjs/core/Materials/Textures/texture';
 import type {AbstractMesh} from '@babylonjs/core/Meshes/abstractMesh';
 import type {LinesMesh} from '@babylonjs/core/Meshes/linesMesh';
 import {Mesh} from '@babylonjs/core/Meshes/mesh';
 import type {TransformNode} from '@babylonjs/core/Meshes/transformNode';
 import {FilesInputStore} from '@babylonjs/core/Misc/filesInputStore';
 import {GridMaterial} from '@babylonjs/materials/grid/gridMaterial';
+import type {GLTFData} from '@babylonjs/serializers/glTF/2.0/glTFData';
+import {GLTF2Export} from '@babylonjs/serializers/glTF/2.0/glTFSerializer';
 import {IBounds} from '@core/math/interfaces/bounds.interface';
 import {IVector3} from '@core/math/interfaces/vector.interface';
 import {getBoundsCenter} from '@core/math/utilities/bounds.utility';
 import {
+    createAsciiPlyFile,
+    createBigEndianPlyFile,
     createCubeGltfFile,
     createEmptyGltfFile,
+    createMeshPlyFile,
+    createObjFiles,
     createPointCloudPlyFile,
     createSplatPlyFile,
     createSplitGltfFiles,
@@ -29,9 +39,16 @@ import {
     createTriangleGltfFile,
     createUnreadableGlbFile
 } from '@core/tests/mocks/model-file.mock';
+import {MODEL_EXPORT_TIMEOUT_MS, MODEL_LOAD_TIMEOUT_MS} from '@core/viewport/constants/model-file.constant';
 import {AXIS_X_COLOR, AXIS_Z_COLOR, BLENDER_NAVIGATION_INPUT_MAP} from '@core/viewport/constants/viewport.constant';
 import {ISceneObject} from '@core/viewport/interfaces/scene-object.interface';
 import {Viewport} from '@core/viewport/services/viewport.service';
+
+// The loader passes straight through to Babylon, unless a spec swaps in a container of its own.
+vi.mock('@babylonjs/core/Loading/sceneLoader', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('@babylonjs/core/Loading/sceneLoader')>();
+    return {...actual, LoadAssetContainerAsync: vi.fn(actual.LoadAssetContainerAsync)};
+});
 
 describe('Viewport', () => {
     const startedViewports: Viewport[] = [];
@@ -172,6 +189,70 @@ describe('Viewport', () => {
         viewport.scene.onPointerObservable.notifyObservers(pointerInfo, PointerEventTypes.POINTERTAP);
     }
 
+    // What an export changes of an object and has to give back: its eye, its materials and its wireframe overlays.
+    function describeObjectDisplay(viewport: Viewport, name: string) {
+        const meshes = getModelMeshes(viewport, name);
+
+        return {
+            isRootEnabled: getRoot(viewport, name).isEnabled(false),
+            materials: meshes.map((mesh) => mesh.material?.name),
+            overlays: meshes.flatMap((mesh) => getOverlays(mesh).map((overlay) => overlay.isEnabled(false))),
+        };
+    }
+
+    // The JSON of a GLB is its first chunk: after the 12 byte header come the chunk's length and type, then its bytes.
+    async function readGlbJson(
+        glb: Blob
+    ): Promise<{materials: {name: string}[]; meshes?: unknown[]; nodes: {name?: string}[]}> {
+        const bytes = new Uint8Array(await glb.arrayBuffer());
+        const chunkLength = new DataView(bytes.buffer).getUint32(12, true);
+
+        return JSON.parse(new TextDecoder().decode(bytes.subarray(20, 20 + chunkLength)));
+    }
+
+    // A GLB read back the way a user would: dropped as a file onto a viewport of its own.
+    async function importGlb(glb: Blob): Promise<ISceneObject[]> {
+        const {viewport} = await startViewport();
+
+        return importObjects(viewport, [new File([glb], 'exported.glb')]);
+    }
+
+    // A selected cube that is hidden, in solid mode and with the wireframe on: everything an export has to undo.
+    async function importCubeWithDisplayOptions() {
+        const {viewport} = await startViewport();
+        const [cube] = await importObjects(viewport, [createCubeGltfFile()]);
+        const [originalMaterial] = describeObjectDisplay(viewport, cube.name).materials;
+        viewport.setShadingMode('solid');
+        viewport.setWireframeVisible(true);
+        viewport.setObjectVisibility(cube.id, false);
+        viewport.selectObject(cube.id);
+
+        return {viewport, cube, originalMaterial};
+    }
+
+    // Everything an import adds to the scene, by name, to see that a failed one left nothing behind.
+    function describeScene(viewport: Viewport): Record<string, string[]> {
+        const {scene} = viewport;
+        const names = (items: {name: string}[]): string[] => items.map((item) => item.name).sort();
+
+        return {
+            meshes: names(scene.meshes),
+            transformNodes: names(scene.transformNodes),
+            materials: names(scene.materials),
+            textures: names(scene.textures),
+            geometries: scene.geometries.map((geometry) => geometry.id).sort(),
+        };
+    }
+
+    // Babylon's own loader, for a spec that hands the viewport a container it has changed or held back.
+    async function importActualLoader(): Promise<typeof LoadAssetContainerAsync> {
+        const sceneLoader = await vi.importActual<typeof import('@babylonjs/core/Loading/sceneLoader')>(
+            '@babylonjs/core/Loading/sceneLoader'
+        );
+
+        return sceneLoader.LoadAssetContainerAsync;
+    }
+
     // The network is a boundary: a request for a file the drop does not hold fails the way a missing file does.
     function stubFailingRequests(): string[] {
         const requestedUrls: string[] = [];
@@ -242,19 +323,21 @@ describe('Viewport', () => {
         for (const viewport of startedViewports.splice(0)) {
             viewport.dispose();
         }
+        vi.useRealTimers();
         vi.unstubAllGlobals();
         vi.restoreAllMocks();
+        vi.mocked(LoadAssetContainerAsync).mockReset();
         document.body.replaceChildren();
     });
 
-    it('creates the engine at the device pixel ratio, capped at 2, with a stencil buffer', async () => {
+    it('creates the engine at the device pixel ratio, capped at 2, with a stencil buffer and tab index 0', async () => {
         const createEngine = vi.spyOn(engineModule, 'Engine');
         const {canvas} = await startViewport();
 
         expect(createEngine).toHaveBeenCalledWith(
             canvas,
             true,
-            {preserveDrawingBuffer: false, stencil: true, limitDeviceRatio: 2},
+            {preserveDrawingBuffer: false, stencil: true, limitDeviceRatio: 2, canvasTabIndex: 0},
             true
         );
     });
@@ -302,6 +385,7 @@ describe('Viewport', () => {
 
         expect((viewport.scene.environmentTexture as hdrCubeTextureModule.HDRCubeTexture).url).toBe('studio.hdr');
         expect(createTexture).toHaveBeenCalledWith('studio.hdr', viewport.scene, 256, false, true, false, true);
+        expect(viewport.scene.environmentIntensity).toBe(0.35);
     });
 
     it('adds a hemispheric fill light and a directional key light', async () => {
@@ -310,9 +394,24 @@ describe('Viewport', () => {
 
         const fillLight = lights.find((light) => light instanceof HemisphericLight);
         const keyLight = lights.find((light) => light instanceof DirectionalLight) as DirectionalLight | undefined;
-        expect(fillLight?.intensity).toBe(0.4);
-        expect(keyLight?.intensity).toBe(0.8);
-        expect(keyLight?.direction.asArray()).toEqual([-0.5, -1, -0.4]);
+        expect(fillLight?.intensity).toBe(0.1);
+        expect(keyLight?.intensity).toBe(1.3);
+    });
+
+    it('hangs the key light from the camera, so it shines from the upper left of every view', async () => {
+        const {viewport} = await startViewport();
+        const keyLight = viewport.scene.getLightByName('key-light') as DirectionalLight;
+
+        expect(keyLight.parent).toBe(viewport.camera);
+        // From the front, the view's right is +X and it looks along -Z.
+        viewport.camera.alpha = Math.PI / 2;
+        viewport.camera.beta = Math.PI / 2;
+        keyLight.computeTransformedInformation();
+        expectPointCloseTo(keyLight.transformedDirection, {x: 0.5, y: -0.5, z: -0.707107});
+        // From the right, the view's right is -Z and it looks along -X.
+        viewport.camera.alpha = 0;
+        keyLight.computeTransformedInformation();
+        expectPointCloseTo(keyLight.transformedDirection, {x: -0.707107, y: -0.5, z: -0.5});
     });
 
     it('orbits the origin from three units away with Blender zoom and clip settings', async () => {
@@ -571,6 +670,19 @@ describe('Viewport', () => {
         expect(result.sceneObjects.map((sceneObject) => sceneObject.name)).toEqual(['pair']);
     });
 
+    it('loads each model file from the dropped files, with options for splat and OBJ files', async () => {
+        const {viewport} = await startViewport();
+        const file = createTriangleGltfFile();
+
+        await importObjects(viewport, [file]);
+
+        // A splat header must not retune the camera, and an .obj must have its textures loaded before it is read.
+        expect(LoadAssetContainerAsync).toHaveBeenCalledWith(file, viewport.scene, {
+            rootUrl: 'file:',
+            pluginOptions: {splat: {disableAutoCameraLimits: true}, obj: {waitForTextures: true}},
+        });
+    });
+
     it('finds a resource file by its lowercase name', async () => {
         const {viewport} = await startViewport();
 
@@ -583,12 +695,14 @@ describe('Viewport', () => {
     it('reports a .gltf whose .bin is missing as unreadable', async () => {
         const requestedUrls = stubFailingRequests();
         const {viewport} = await startViewport();
+        const before = describeScene(viewport);
         const [gltf] = createSplitGltfFiles();
 
         const result = await viewport.importFiles([gltf]);
 
         expect(result).toEqual({sceneObjects: [], failures: [{fileName: 'pair.gltf', reason: 'unreadable'}]});
         expect(requestedUrls).toEqual([expect.stringContaining('pair.bin')]);
+        expect(describeScene(viewport)).toEqual(before);
     });
 
     it('removes the dropped files from the store afterwards', async () => {
@@ -698,6 +812,176 @@ describe('Viewport', () => {
         expect(viewport.scene.meshes.map((mesh) => mesh.name).sort()).toEqual(['axis-x', 'axis-z', 'grid-floor']);
     });
 
+    it('imports a binary little-endian .ply with a face as a mesh', async () => {
+        const {viewport} = await startViewport();
+
+        const [mesh] = await importObjects(viewport, [createMeshPlyFile()]);
+
+        expect(mesh).toMatchObject({name: 'mesh', fileName: 'mesh.ply', stats: {pointCount: 3, triangleCount: 1}});
+    });
+
+    it('reports a .ply that is not little-endian binary as unreadable without loading it', async () => {
+        const {viewport} = await startViewport();
+        const before = describeScene(viewport);
+        const unformatted = new File(['ply\nelement vertex 0\nend_header\n'], 'unformatted.ply');
+        const files = [createAsciiPlyFile(), createBigEndianPlyFile(), unformatted, new File([], 'empty.ply')];
+
+        const result = await viewport.importFiles(files);
+
+        const failures = files.map((file) => ({fileName: file.name, reason: 'unreadable'}));
+        expect(result).toEqual({sceneObjects: [], failures});
+        expect(LoadAssetContainerAsync).not.toHaveBeenCalled();
+        expect(describeScene(viewport)).toEqual(before);
+    });
+
+    it('reports a .ply it cannot read from disk as unreadable, and keeps the rest of the drop', async () => {
+        const {viewport} = await startViewport();
+        const unreadable = createMeshPlyFile('gone.ply');
+        vi.spyOn(unreadable, 'slice').mockReturnValue({
+            text: () => Promise.reject(new Error('The file is gone.')),
+        } as unknown as Blob);
+
+        const result = await viewport.importFiles([createTriangleGltfFile(), unreadable]);
+
+        expect(result.failures).toEqual([{fileName: 'gone.ply', reason: 'unreadable'}]);
+        expect(result.sceneObjects.map((sceneObject) => sceneObject.name)).toEqual(['triangle']);
+        expect(LoadAssetContainerAsync).toHaveBeenCalledTimes(1);
+    });
+
+    it('gives up on a load that never settles, and the next import still runs', async () => {
+        const {viewport} = await startViewport();
+        viewport.scene.getEngine().stopRenderLoop();
+        vi.useFakeTimers({toFake: ['setTimeout', 'clearTimeout']});
+        vi.mocked(LoadAssetContainerAsync).mockImplementationOnce(() => new Promise<never>(() => undefined));
+        const settled = vi.fn();
+        const stuckImport = viewport.importFiles([createTriangleGltfFile('stuck.gltf')]).then(settled);
+
+        await vi.advanceTimersByTimeAsync(MODEL_LOAD_TIMEOUT_MS - 1);
+        expect(settled).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+        await stuckImport;
+
+        const failures = [{fileName: 'stuck.gltf', reason: 'unreadable'}];
+        expect(settled).toHaveBeenCalledWith({sceneObjects: [], failures});
+        vi.useRealTimers();
+        const next = await viewport.importFiles([createTriangleGltfFile()]);
+        expect(next.failures).toEqual([]);
+        expect(next.sceneObjects.map((sceneObject) => sceneObject.name)).toEqual(['triangle']);
+    });
+
+    it('throws away what a load it gave up on brings when it finishes late', async () => {
+        const {viewport} = await startViewport();
+        viewport.scene.getEngine().stopRenderLoop();
+        const loadContainer = await importActualLoader();
+        const lateContainer = await loadContainer(createCubeGltfFile(), viewport.scene, {rootUrl: 'file:'});
+        const before = describeScene(viewport);
+        let finishLoad: (container: AssetContainer) => void = () => undefined;
+        vi.mocked(LoadAssetContainerAsync).mockImplementationOnce(
+            () => new Promise<AssetContainer>((resolve) => (finishLoad = resolve))
+        );
+        vi.useFakeTimers({toFake: ['setTimeout', 'clearTimeout']});
+        const stuckImport = viewport.importFiles([createCubeGltfFile()]);
+        await vi.advanceTimersByTimeAsync(MODEL_LOAD_TIMEOUT_MS);
+        await stuckImport;
+        vi.useRealTimers();
+
+        finishLoad(lateContainer);
+
+        await vi.waitFor(() => expect(lateContainer.meshes.every((mesh) => mesh.isDisposed())).toBe(true));
+        expect(describeScene(viewport)).toEqual(before);
+    });
+
+    it('clears the timer of a load once it has settled', async () => {
+        const {viewport} = await startViewport();
+        viewport.scene.getEngine().stopRenderLoop();
+        const loadContainer = await importActualLoader();
+        const container = await loadContainer(createCubeGltfFile(), viewport.scene, {rootUrl: 'file:'});
+        vi.useFakeTimers({toFake: ['setTimeout', 'clearTimeout']});
+        vi.mocked(LoadAssetContainerAsync).mockResolvedValueOnce(container);
+
+        const result = await viewport.importFiles([createCubeGltfFile()]);
+
+        expect(result.sceneObjects).toHaveLength(1);
+        // Babylon's own zero-delay timers run first, so that only a timer with a delay left over would count.
+        await vi.advanceTimersByTimeAsync(0);
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('drops only the file that fails after it loaded, and keeps the rest of the drop', async () => {
+        const {viewport} = await startViewport();
+        const loadContainer = await importActualLoader();
+        let failedContainer: AssetContainer | undefined;
+        vi.mocked(LoadAssetContainerAsync).mockImplementationOnce(async (source, scene, options) => {
+            failedContainer = await loadContainer(source, scene, options);
+            for (const mesh of failedContainer.meshes) {
+                mesh.getBoundingInfo = () => {
+                    throw new Error('no bounds');
+                };
+            }
+
+            return failedContainer;
+        });
+
+        const result = await viewport.importFiles([createCubeGltfFile(), createTriangleGltfFile()]);
+
+        expect(result.failures).toEqual([{fileName: 'cube.gltf', reason: 'unreadable'}]);
+        expect(result.sceneObjects.map((sceneObject) => [sceneObject.id, sceneObject.name])).toEqual([
+            ['object-1', 'triangle'],
+        ]);
+        expect(failedContainer?.meshes.every((mesh) => mesh.isDisposed())).toBe(true);
+        expect(viewport.scene.getTransformNodeByName('cube')).toBeNull();
+        expect(viewport.scene.meshes.filter((mesh) => failedContainer?.meshes.includes(mesh))).toEqual([]);
+        const sceneMaterials = viewport.scene.materials;
+        expect(sceneMaterials.filter((material) => failedContainer?.materials.includes(material))).toEqual([]);
+        expect(viewport.scene.transformNodes.map((node) => node.name)).toEqual(['triangle']);
+    });
+
+    it('does not block the next import when it is handed something that is no drop', async () => {
+        const {viewport} = await startViewport();
+
+        await expect(viewport.importFiles(undefined as unknown as File[])).rejects.toThrow();
+        const next = await viewport.importFiles([createTriangleGltfFile()]);
+
+        expect(next.sceneObjects).toHaveLength(1);
+    });
+
+    it('styles each object right after it loads, before the next file of the drop is read', async () => {
+        const {viewport} = await startViewport();
+        viewport.setShadingMode('solid');
+        viewport.setWireframeVisible(true);
+        const loadContainer = await importActualLoader();
+        let firstObject: {material: string | undefined; overlays: number} | undefined;
+        vi.mocked(LoadAssetContainerAsync).mockImplementationOnce((source, scene, options) =>
+            loadContainer(source, scene, options)
+        );
+        vi.mocked(LoadAssetContainerAsync).mockImplementationOnce(async (source, scene, options) => {
+            const [mesh] = getModelMeshes(viewport, 'a');
+            firstObject = {material: mesh.material?.name, overlays: getOverlays(mesh).length};
+
+            return loadContainer(source, scene, options);
+        });
+
+        await importObjects(viewport, [createTriangleGltfFile('a.gltf'), createTriangleGltfFile('b.gltf')]);
+
+        expect(firstObject).toEqual({material: 'hulma-clay', overlays: 1});
+    });
+
+    it('imports an .obj with its .mtl and the texture it names', async () => {
+        const {viewport} = await startViewport();
+
+        const result = await viewport.importFiles(createObjFiles());
+
+        expect(result.failures).toEqual([]);
+        expect(result.sceneObjects).toHaveLength(1);
+        expect(result.sceneObjects[0]).toMatchObject({
+            name: 'model',
+            fileName: 'model.obj',
+            stats: {pointCount: 3, triangleCount: 1},
+            textures: [{name: 'file:texture.png', width: 512, height: 512}],
+        });
+        expect(Object.keys(FilesInputStore.FilesToLoad)).toEqual([]);
+    });
+
     it('reports a file without any mesh as unreadable', async () => {
         const {viewport} = await startViewport();
 
@@ -750,6 +1034,30 @@ describe('Viewport', () => {
         for (const texture of textured.textures) {
             expect([texture.width, texture.height]).toEqual([512, 512]);
         }
+    });
+
+    it('lists the textures of every sub-material of a multi-material', async () => {
+        const {viewport} = await startViewport();
+        const loadContainer = await importActualLoader();
+        vi.mocked(LoadAssetContainerAsync).mockImplementationOnce(async (source, scene, options) => {
+            const container = await loadContainer(source, scene, options);
+            const mesh = container.meshes.find((candidate) => candidate.getTotalVertices() > 0)!;
+            const extra = new StandardMaterial('extra', scene);
+            extra.diffuseTexture = new Texture('file:extra.png', scene);
+            const multiMaterial = new MultiMaterial('multi', scene);
+            multiMaterial.subMaterials = [mesh.material, null, extra];
+            mesh.material = multiMaterial;
+
+            return container;
+        });
+
+        const [textured] = await importObjects(viewport, [createTexturedGltfFile()]);
+
+        expect(textured.textures.map((texture) => texture.name)).toEqual([
+            expect.stringContaining('Base Color'),
+            expect.any(String),
+            'file:extra.png',
+        ]);
     });
 
     it('lists the textures of an object imported in solid mode', async () => {
@@ -990,7 +1298,8 @@ describe('Viewport', () => {
         const clay = meshes[0].material as PBRMaterial;
         expect(clay).toBeInstanceOf(PBRMaterial);
         expect(meshes[1].material).toBe(clay);
-        expect(clay.albedoColor.toHexString()).toBe('#BDBDBD');
+        // PBR albedo is linear, so #BDBDBD is what the clay shows only once its albedo is the linear form of it.
+        expect(clay.albedoColor.toGammaSpace().toHexString()).toBe('#BDBDBD');
         expect(clay.metallic).toBe(0);
         expect(clay.roughness).toBe(0.65);
 
@@ -1154,5 +1463,254 @@ describe('Viewport', () => {
         expect(Math.abs(viewport.camera.alpha - alpha)).toBeLessThan(1e-6);
         expect(Math.abs(viewport.camera.beta - beta)).toBeLessThan(1e-6);
         expect(viewport.camera.target.subtract(pivot).length()).toBeLessThan(1e-6);
+    });
+
+    it('exports an object as a GLB that imports back', async () => {
+        const {viewport} = await startViewport();
+        const [cube] = await importObjects(viewport, [createCubeGltfFile()]);
+
+        const glb = await viewport.exportObjectAsGlb(cube.id);
+
+        const [reimported] = await importGlb(glb);
+        expect(reimported.stats).toEqual({pointCount: 8, triangleCount: 12});
+    });
+
+    it('exports a hidden object', async () => {
+        const {viewport} = await startViewport();
+        const [cube] = await importObjects(viewport, [createCubeGltfFile()]);
+        viewport.setObjectVisibility(cube.id, false);
+
+        const glb = await viewport.exportObjectAsGlb(cube.id);
+
+        const [reimported] = await importGlb(glb);
+        expect(reimported.stats.triangleCount).toBe(12);
+    });
+
+    it('exports original materials in solid mode', async () => {
+        const {viewport, cube, originalMaterial} = await importCubeWithDisplayOptions();
+
+        const {materials, nodes} = await readGlbJson(await viewport.exportObjectAsGlb(cube.id));
+
+        expect(materials.map((material) => material.name)).toEqual([originalMaterial]);
+        expect(nodes.filter((node) => node.name?.endsWith('-wireframe'))).toEqual([]);
+    });
+
+    it('exports only the requested object', async () => {
+        const {viewport} = await startViewport();
+        const [, cube] = await importObjects(viewport, [createTriangleGltfFile(), createCubeGltfFile()]);
+
+        const glb = await viewport.exportObjectAsGlb(cube.id);
+
+        const reimported = await importGlb(glb);
+        expect(reimported).toHaveLength(1);
+        expect(reimported[0].stats).toEqual({pointCount: 8, triangleCount: 12});
+    });
+
+    it('leaves a disabled node out of the file, and what hangs below it', async () => {
+        const {viewport} = await startViewport();
+        const [cube] = await importObjects(viewport, [createCubeGltfFile()]);
+        const [mesh] = getModelMeshes(viewport, cube.name);
+        const exportMeshes = async () => (await readGlbJson(await viewport.exportObjectAsGlb(cube.id))).meshes ?? [];
+
+        expect(await exportMeshes()).toHaveLength(1);
+
+        // The mesh itself, which is how Molding will switch off an original, and the loader's node above it.
+        for (const node of [mesh, mesh.parent!]) {
+            node.setEnabled(false);
+
+            expect(await exportMeshes(), node.name).toEqual([]);
+
+            node.setEnabled(true);
+        }
+    });
+
+    it('exports an object where it stands on the grid, so the file keeps that pivot', async () => {
+        const {viewport} = await startViewport();
+        const loadContainer = await importActualLoader();
+
+        for (const file of [createCubeGltfFile(), createTransformedGltfFile()]) {
+            const [sceneObject] = await importObjects(viewport, [file]);
+            const glb = await viewport.exportObjectAsGlb(sceneObject.id);
+
+            // Loaded as it is, without the grounding an import adds, so that only the file puts the model in place.
+            const container = await loadContainer(new File([glb], 'raw.glb'), viewport.scene, {rootUrl: 'file:'});
+            const bounds = getWorldBounds(container.meshes.filter((mesh) => mesh.getTotalVertices() > 0));
+            container.dispose();
+
+            const center = getBoundsCenter(bounds);
+            expect(Math.abs(center.x), file.name).toBeLessThan(1e-6);
+            expect(Math.abs(center.z), file.name).toBeLessThan(1e-6);
+            expect(Math.abs(bounds.minimum.y), file.name).toBeLessThan(1e-6);
+        }
+    });
+
+    it('rejects for an object it does not hold', async () => {
+        const {viewport} = await startViewport();
+
+        await expect(viewport.exportObjectAsGlb('object-9')).rejects.toThrow('object-9');
+    });
+
+    it('puts the object back as it was after an export', async () => {
+        const {viewport, cube} = await importCubeWithDisplayOptions();
+        const before = describeObjectDisplay(viewport, cube.name);
+        expect(before).toEqual({isRootEnabled: false, materials: ['hulma-clay'], overlays: [true]});
+
+        await viewport.exportObjectAsGlb(cube.id);
+
+        expect(describeObjectDisplay(viewport, cube.name)).toEqual(before);
+    });
+
+    it('puts the object back as it was when the export fails, and holds nothing up', async () => {
+        const {viewport, cube, originalMaterial} = await importCubeWithDisplayOptions();
+        const before = describeObjectDisplay(viewport, cube.name);
+        expect(before).toEqual({isRootEnabled: false, materials: ['hulma-clay'], overlays: [true]});
+        let during: ReturnType<typeof describeObjectDisplay> | undefined;
+        vi.spyOn(GLTF2Export, 'GLBAsync').mockImplementationOnce(async () => {
+            during = describeObjectDisplay(viewport, cube.name);
+            throw new Error('The serializer failed.');
+        });
+
+        await expect(viewport.exportObjectAsGlb(cube.id)).rejects.toThrow('The serializer failed.');
+        const frameId = viewport.scene.getFrameId();
+
+        expect(during).toEqual({isRootEnabled: true, materials: [originalMaterial], overlays: [false]});
+        expect(describeObjectDisplay(viewport, cube.name)).toEqual(before);
+        await vi.waitFor(() => expect(viewport.scene.getFrameId()).toBeGreaterThan(frameId));
+        await expect(viewport.exportObjectAsGlb(cube.id)).resolves.toBeInstanceOf(Blob);
+    });
+
+    it('resumes drawing and frees the turn even when putting the object back throws', async () => {
+        const {viewport, cube} = await importCubeWithDisplayOptions();
+        vi.spyOn(viewport, 'setShadingMode').mockImplementationOnce(() => {
+            throw new Error('The shading could not be given back.');
+        });
+
+        await expect(viewport.exportObjectAsGlb(cube.id)).rejects.toThrow('The shading could not be given back.');
+        const frameId = viewport.scene.getFrameId();
+
+        await vi.waitFor(() => expect(viewport.scene.getFrameId()).toBeGreaterThan(frameId));
+        await expect(viewport.exportObjectAsGlb(cube.id)).resolves.toBeInstanceOf(Blob);
+    });
+
+    it('gives up on an export that never settles, puts the object back and lets the next export run', async () => {
+        const {viewport, cube, originalMaterial} = await importCubeWithDisplayOptions();
+        const before = describeObjectDisplay(viewport, cube.name);
+        expect(before).toEqual({isRootEnabled: false, materials: ['hulma-clay'], overlays: [true]});
+        let finishLate: (data: GLTFData) => void = () => undefined;
+        const exportGlb = vi
+            .spyOn(GLTF2Export, 'GLBAsync')
+            .mockImplementationOnce(() => new Promise<GLTFData>((resolve) => (finishLate = resolve)));
+        vi.useFakeTimers({toFake: ['setTimeout', 'clearTimeout']});
+        const settled = vi.fn();
+        const stuckExport = viewport.exportObjectAsGlb(cube.id).then(settled, settled);
+
+        await vi.advanceTimersByTimeAsync(MODEL_EXPORT_TIMEOUT_MS - 1);
+
+        expect(exportGlb).toHaveBeenCalledTimes(1);
+        expect(settled).not.toHaveBeenCalled();
+        expect(describeObjectDisplay(viewport, cube.name)).toEqual({
+            isRootEnabled: true,
+            materials: [originalMaterial],
+            overlays: [false],
+        });
+
+        await vi.advanceTimersByTimeAsync(1);
+        await stuckExport;
+
+        expect(settled).toHaveBeenCalledTimes(1);
+        const [error] = settled.mock.calls[0];
+        expect(error).toBeInstanceOf(Error);
+        expect(error.message).toContain(cube.name);
+        expect(describeObjectDisplay(viewport, cube.name)).toEqual(before);
+
+        // What the serializer produces after the timeout is dropped.
+        finishLate({files: {'cube.glb': new Blob()}} as unknown as GLTFData);
+        await vi.advanceTimersByTimeAsync(0);
+
+        expect(settled).toHaveBeenCalledTimes(1);
+        expect(describeObjectDisplay(viewport, cube.name)).toEqual(before);
+
+        vi.useRealTimers();
+        const frameId = viewport.scene.getFrameId();
+        await vi.waitFor(() => expect(viewport.scene.getFrameId()).toBeGreaterThan(frameId));
+        await expect(viewport.exportObjectAsGlb(cube.id)).resolves.toBeInstanceOf(Blob);
+    });
+
+    it('clears the timer of an export once it has settled, whether it worked or failed', async () => {
+        const {viewport} = await startViewport();
+        const [cube] = await importObjects(viewport, [createCubeGltfFile()]);
+        viewport.scene.getEngine().stopRenderLoop();
+        vi.useFakeTimers({toFake: ['setTimeout', 'clearTimeout']});
+        vi.spyOn(GLTF2Export, 'GLBAsync').mockRejectedValueOnce(new Error('The serializer failed.'));
+
+        await expect(viewport.exportObjectAsGlb(cube.id)).rejects.toThrow('The serializer failed.');
+
+        expect(vi.getTimerCount()).toBe(0);
+
+        await expect(viewport.exportObjectAsGlb(cube.id)).resolves.toBeInstanceOf(Blob);
+
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('keeps a hidden object hidden when it is exported twice at once', async () => {
+        const {viewport} = await startViewport();
+        const [cube] = await importObjects(viewport, [createCubeGltfFile()]);
+        viewport.setObjectVisibility(cube.id, false);
+
+        const [first, second] = await Promise.all([
+            viewport.exportObjectAsGlb(cube.id),
+            viewport.exportObjectAsGlb(cube.id),
+        ]);
+
+        expect(first.size).toBeGreaterThan(0);
+        expect(second.size).toBe(first.size);
+        expect(getRoot(viewport, cube.name).isEnabled(false)).toBe(false);
+    });
+
+    it('exports only after the import that was asked for before it', async () => {
+        const {viewport} = await startViewport();
+        const [cube] = await importObjects(viewport, [createCubeGltfFile()]);
+        const loadContainer = await importActualLoader();
+        let releaseLoad: () => void = () => undefined;
+        const loadHeldBack = new Promise<void>((resolve) => (releaseLoad = resolve));
+        vi.mocked(LoadAssetContainerAsync).mockImplementationOnce(async (source, scene, options) => {
+            await loadHeldBack;
+
+            return loadContainer(source, scene, options);
+        });
+        const exportGlb = vi.spyOn(GLTF2Export, 'GLBAsync');
+
+        const importing = viewport.importFiles([createTriangleGltfFile()]);
+        const exporting = viewport.exportObjectAsGlb(cube.id);
+        await new Promise((resolve) => setTimeout(resolve, 50));
+
+        expect(exportGlb).not.toHaveBeenCalled();
+
+        releaseLoad();
+        const [result] = await Promise.all([importing, exporting]);
+
+        expect(result.sceneObjects).toHaveLength(1);
+        expect(exportGlb).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not draw the viewport while an export runs', async () => {
+        const {viewport} = await startViewport();
+        const [cube] = await importObjects(viewport, [createCubeGltfFile()]);
+        const {scene} = viewport;
+        let finishExport: (data: GLTFData) => void = () => undefined;
+        const exportGlb = vi
+            .spyOn(GLTF2Export, 'GLBAsync')
+            .mockImplementationOnce(() => new Promise<GLTFData>((resolve) => (finishExport = resolve)));
+
+        const exporting = viewport.exportObjectAsGlb(cube.id);
+        await vi.waitFor(() => expect(exportGlb).toHaveBeenCalled());
+        const frameId = scene.getFrameId();
+        await new Promise((resolve) => setTimeout(resolve, 100));
+
+        expect(scene.getFrameId()).toBe(frameId);
+
+        finishExport({files: {'cube.glb': new Blob()}} as unknown as GLTFData);
+        await exporting;
+        await vi.waitFor(() => expect(scene.getFrameId()).toBeGreaterThan(frameId));
     });
 });

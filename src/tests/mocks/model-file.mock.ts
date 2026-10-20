@@ -154,17 +154,24 @@ export function createUnreadableGlbFile(fileName = 'broken.glb'): File {
     return new File([crypto.getRandomValues(new Uint8Array(64))], fileName);
 }
 
-function createPlyFile(fileName: string, propertyNames: string[], vertices: number[][]): File {
+function createPlyFile(
+    fileName: string,
+    propertyNames: string[],
+    vertices: number[][],
+    format = 'binary_little_endian'
+): File {
     const header = [
         'ply',
-        'format binary_little_endian 1.0',
+        `format ${format} 1.0`,
         `element vertex ${vertices.length}`,
         ...propertyNames.map((name) => `property float ${name}`),
         'end_header',
         '',
     ].join('\n');
+    const floats = new DataView(new ArrayBuffer(vertices.flat().length * 4));
+    vertices.flat().forEach((value, index) => floats.setFloat32(index * 4, value, format === 'binary_little_endian'));
 
-    return new File([header, new Float32Array(vertices.flat())], fileName);
+    return new File([header, floats], fileName);
 }
 
 // Three vertices and no faces, which Babylon loads as a point cloud.
@@ -178,4 +185,67 @@ export function createSplatPlyFile(fileName = 'splat.ply'): File {
     propertyNames.push('scale_0', 'scale_1', 'scale_2', 'rot_0', 'rot_1', 'rot_2', 'rot_3');
 
     return createPlyFile(fileName, propertyNames, [[0, 0, 0, 0.5, 0.5, 0.5, 1, -2, -2, -2, 1, 0, 0, 0]]);
+}
+
+// Three vertices and no faces, but in big-endian, which Babylon would decode as little-endian.
+export function createBigEndianPlyFile(fileName = 'big-endian.ply'): File {
+    return createPlyFile(fileName, ['x', 'y', 'z'], [[0, 0, 0], [1, 0, 0], [0, 1, 0]], 'binary_big_endian');
+}
+
+// A triangle with a face as an ASCII PLY, which Babylon would decode as binary.
+export function createAsciiPlyFile(fileName = 'ascii.ply'): File {
+    const lines = [
+        'ply',
+        'format ascii 1.0',
+        'element vertex 3',
+        'property float x',
+        'property float y',
+        'property float z',
+        'element face 1',
+        'property list uchar int vertex_indices',
+        'end_header',
+        '0 0 0',
+        '1 0 0',
+        '0 1 0',
+        '3 0 1 2',
+        '',
+    ];
+
+    return new File([lines.join('\n')], fileName);
+}
+
+// One textured triangle as an .obj with its .mtl, and the image the .mtl names.
+export function createObjFiles(baseName = 'model'): File[] {
+    const lines = [`mtllib ${baseName}.mtl`, 'o triangle', 'v 0 0 0', 'v 1 0 0', 'v 0 1 0'];
+    lines.push('vt 0 0', 'vt 1 0', 'vt 0 1', 'usemtl painted', 'f 1/1 2/2 3/3', '');
+    const material = ['newmtl painted', 'Kd 1 1 1', 'map_Kd texture.png', ''];
+    const image = Uint8Array.from(atob(PNG_BASE64), (character) => character.charCodeAt(0));
+
+    return [
+        new File([lines.join('\n')], `${baseName}.obj`),
+        new File([material.join('\n')], `${baseName}.mtl`),
+        new File([image], 'texture.png'),
+    ];
+}
+
+// A triangle with a face as binary little-endian PLY, the one kind Babylon reads as a mesh.
+export function createMeshPlyFile(fileName = 'mesh.ply'): File {
+    const header = [
+        'ply',
+        'format binary_little_endian 1.0',
+        'element vertex 3',
+        'property float x',
+        'property float y',
+        'property float z',
+        'element face 1',
+        'property list uchar int vertex_indices',
+        'end_header',
+        '',
+    ].join('\n');
+    const body = new DataView(new ArrayBuffer(3 * 12 + 1 + 3 * 4));
+    [0, 0, 0, 1, 0, 0, 0, 1, 0].forEach((value, index) => body.setFloat32(index * 4, value, true));
+    body.setUint8(36, 3);
+    [0, 1, 2].forEach((vertex, index) => body.setInt32(37 + index * 4, vertex, true));
+
+    return new File([header, body], fileName);
 }

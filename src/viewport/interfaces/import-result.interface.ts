@@ -1,4 +1,4 @@
-import {ISceneObject} from '@core/viewport/interfaces/scene-object.interface';
+import {ISceneObject} from './scene-object.interface';
 
 export type TImportFailureReason = 'unsupported-format' | 'unreadable';
 

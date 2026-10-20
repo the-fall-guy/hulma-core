@@ -1,5 +1,6 @@
 import type {ArcRotateInteraction} from '@babylonjs/core/Cameras/arcRotateCameraMovement';
 import type {InputMapEntry} from '@babylonjs/core/Cameras/inputMapper';
+import {IVector3} from '@core/math/interfaces/vector.interface';
 import {ICameraAngles} from '@core/viewport/interfaces/camera-angles.interface';
 
 export const VIEWPORT_BACKGROUND_COLOR = '#3D3D3D';
@@ -13,6 +14,17 @@ export const WIREFRAME_COLOR = '#1A1A1A';
 export const WIREFRAME_ALPHA = 0.35;
 
 export const GRID_SIZE = 200;
+
+// The studio .hdr lights the scene, with a hemispheric fill and a directional key on top. Measured in the browser on
+// TRELLIS models: these keep the clay mid-grey with visible shading from every side, and textured models unclipped.
+export const ENVIRONMENT_INTENSITY = 0.35;
+export const FILL_LIGHT_INTENSITY = 0.1;
+export const KEY_LIGHT_INTENSITY = 1.3;
+
+// The key light hangs from the camera and shines from the upper left of the view, on the viewer's side, as the studio
+// light of Blender's Solid mode does, so a model keeps its form from every angle. This is the way the light travels,
+// in the camera's own space, where +X is right, +Y is up and -Z looks into the scene.
+export const KEY_LIGHT_DIRECTION: IVector3 = {x: 0.5, y: -0.5, z: -0.707107};
 
 export const BLENDER_NAVIGATION_INPUT_MAP: InputMapEntry<ArcRotateInteraction>[] = [
     {source: 'pointer', button: 1, modifiers: {shift: true}, interaction: 'pan'},

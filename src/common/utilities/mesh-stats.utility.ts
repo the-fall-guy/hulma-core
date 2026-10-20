@@ -8,7 +8,7 @@ export function countUniquePoints(positions: ArrayLike<number>): number {
     // A hash table of point numbers (plus one, so that 0 marks a free slot) with linear probing, between 35% and 70%
     // full. A string key per point in a Set would be far too slow for a mesh of several hundred thousand vertices.
     let capacity = 2;
-    while (capacity < pointCount * 0.5) {
+    while (capacity < pointCount * 1.4) {
         capacity *= 2;
     }
     const mask = capacity - 1;

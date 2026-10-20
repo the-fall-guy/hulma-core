@@ -1,4 +1,6 @@
+import type {AssetContainer} from '@babylonjs/core/assetContainer';
 import {ArcRotateCamera} from '@babylonjs/core/Cameras/arcRotateCamera';
+// Registers the ray casting that Scene.pick needs for a click to find a mesh. Nothing else imports it.
 import '@babylonjs/core/Culling/ray';
 import {Engine} from '@babylonjs/core/Engines/engine';
 import {PointerEventTypes} from '@babylonjs/core/Events/pointerEvents';
@@ -22,20 +24,34 @@ import {FilesInputStore} from '@babylonjs/core/Misc/filesInputStore';
 import type {Node} from '@babylonjs/core/node';
 import {Scene} from '@babylonjs/core/scene';
 import {registerBuiltInLoaders} from '@babylonjs/loaders/dynamic';
+// Types only: they let pluginOptions name the options of the OBJ and the splat loaders.
+import type {} from '@babylonjs/loaders/OBJ/objFileLoader.types';
 import type {} from '@babylonjs/loaders/SPLAT/splatFileLoader.types';
 import {GridMaterial} from '@babylonjs/materials/grid/gridMaterial';
+// Lets the exporter write WebP images, as TRELLIS models and casts have, in a file that other tools can open.
+import '@babylonjs/serializers/glTF/2.0/Extensions/EXT_texture_webp';
+import {GLTF2Export} from '@babylonjs/serializers/glTF/2.0/glTFSerializer';
 import {IMeshStats} from '@core/common/interfaces/mesh-stats.interface';
 import {countUniquePoints} from '@core/common/utilities/mesh-stats.utility';
 import {getBoundsSize, getGroundingOffset} from '@core/math/utilities/bounds.utility';
+import {
+    MODEL_EXPORT_TIMEOUT_MS,
+    MODEL_LOAD_TIMEOUT_MS,
+    PLY_HEADER_BYTE_COUNT
+} from '@core/viewport/constants/model-file.constant';
 import {
     AXIS_X_COLOR,
     AXIS_Z_COLOR,
     BLENDER_NAVIGATION_INPUT_MAP,
     CLAY_COLOR,
     EDITABLE_TAG_NAMES,
+    ENVIRONMENT_INTENSITY,
+    FILL_LIGHT_INTENSITY,
     GRID_LINE_COLOR,
     GRID_LINE_OPACITY,
     GRID_SIZE,
+    KEY_LIGHT_DIRECTION,
+    KEY_LIGHT_INTENSITY,
     NUMPAD_VIEWS,
     SELECTION_OUTLINE_COLOR,
     VIEWPORT_BACKGROUND_COLOR,
@@ -49,7 +65,11 @@ import {ISceneObject} from '@core/viewport/interfaces/scene-object.interface';
 import {TShadingMode} from '@core/viewport/interfaces/shading-mode.interface';
 import {ITextureInfo} from '@core/viewport/interfaces/texture-info.interface';
 import {IViewportOptions} from '@core/viewport/interfaces/viewport-options.interface';
-import {groupDroppedFiles} from '@core/viewport/utilities/model-file.utility';
+import {
+    getFileExtension,
+    groupDroppedFiles,
+    isLittleEndianPlyHeader
+} from '@core/viewport/utilities/model-file.utility';
 import {createUniqueObjectName, getObjectNameFromFileName} from '@core/viewport/utilities/object-name.utility';
 
 export class Viewport {
@@ -68,8 +88,11 @@ export class Viewport {
     private objectCounter = 0;
     private selectedEntry: ISceneEntry | null = null;
 
-    // Settles when the import that started last is done, so that the next one waits for its turn.
-    private lastImport: Promise<void> = Promise.resolve();
+    // While an export holds an object in the state it writes, which is not meant to be seen, nothing is drawn.
+    private isExporting = false;
+
+    // Settles when the import or export that started last is done, so that the next one waits for its turn.
+    private lastOperation: Promise<void> = Promise.resolve();
 
     private readonly sceneEntries = new Map<string, ISceneEntry>();
     private readonly pickListeners: ((objectId: string | null) => void)[] = [];
@@ -78,13 +101,22 @@ export class Viewport {
     private readonly originalMaterials = new Map<AbstractMesh, Material | null>();
     private readonly wireframeOverlays = new Map<AbstractMesh, Mesh>();
 
+    // Home and numpad period: frame the selected object or, like Blender's Home, everything that is shown.
+    private readonly frameSelection = (): void => {
+        this.frameEntries(
+            this.selectedEntry
+                ? [this.selectedEntry]
+                : [...this.sceneEntries.values()].filter((entry) => entry.root.isEnabled())
+        );
+    };
+
     // Key code, with a Ctrl+ prefix while Ctrl is held, to what the key does.
     private readonly shortcuts: Partial<Record<string, () => void>> = {
         ...Object.fromEntries(
             Object.entries(NUMPAD_VIEWS).map(([key, view]): [string, () => void] => [key, () => this.jumpToView(view)])
         ),
-        Home: () => this.frameSelection(),
-        NumpadDecimal: () => this.frameSelection(),
+        Home: this.frameSelection,
+        NumpadDecimal: this.frameSelection,
     };
 
     private readonly trackPointerOverCanvas = (event: PointerEvent): void => {
@@ -141,11 +173,12 @@ export class Viewport {
     }
 
     public async start(): Promise<void> {
-        // Renders at the device pixel ratio, capped at 2.
+        // Renders at the device pixel ratio, capped at 2. Babylon's own tab index of 1 would put the canvas ahead of
+        // the whole page in the Tab order, and Babylon sets the index again on every pointer move, so it goes here.
         const engine = new Engine(
             this.canvas,
             true,
-            {preserveDrawingBuffer: false, stencil: true, limitDeviceRatio: 2},
+            {preserveDrawingBuffer: false, stencil: true, limitDeviceRatio: 2, canvasTabIndex: 0},
             true
         );
         this.engine = engine;
@@ -181,7 +214,13 @@ export class Viewport {
         // Dragging to orbit is no tap, so it never picks.
         this.babylonScene.onPointerObservable.add(this.reportPick, PointerEventTypes.POINTERTAP);
 
-        engine.runRenderLoop(() => this.babylonScene.render());
+        engine.runRenderLoop(() => {
+            // A frame that is not drawn leaves the canvas on the last one, so the export's state is never seen.
+            if (this.isExporting) {
+                return;
+            }
+            this.babylonScene.render();
+        });
         this.resizeObserver = new ResizeObserver(() => engine.resize());
         this.resizeObserver.observe(this.canvas);
         this.canvas.addEventListener('pointerenter', this.trackPointerOverCanvas);
@@ -200,51 +239,48 @@ export class Viewport {
     /**
      * Adds the model files of a drop to the scene, one object each, with the other files of the drop as their
      * resources (a .bin, an .mtl, textures). An object lands at the center of the grid with its base on it, and the
-     * camera frames the last one. Files that cannot be opened are named in `failures`. A drop that arrives while
-     * another is being imported waits for it.
+     * camera frames the last one. Files that cannot be opened, or that Babylon has not finished reading after a
+     * minute, are named in `failures`. A drop that arrives while another is being imported, or an object exported,
+     * waits for it.
      */
     public async importFiles(files: File[]): Promise<IImportResult> {
-        const earlierImport = this.lastImport;
-        let finishImport = (): void => undefined;
-        this.lastImport = new Promise<void>((resolve) => {
-            finishImport = resolve;
-        });
-        await earlierImport;
+        const finishOperation = await this.takeTurn();
 
-        const {modelFiles, resourceFiles, unsupportedFiles} = groupDroppedFiles(files);
-        const result: IImportResult = {
-            sceneObjects: [],
-            failures: unsupportedFiles.map((file) => ({fileName: file.name, reason: 'unsupported-format'})),
-        };
-
-        // A model finds its .bin, .mtl and textures here, by their lowercase names.
-        const storedNames = [...modelFiles, ...resourceFiles].map((file) => file.name.toLowerCase());
-        for (const file of [...modelFiles, ...resourceFiles]) {
-            FilesInputStore.FilesToLoad[file.name.toLowerCase()] = file;
-        }
-
+        const result: IImportResult = {sceneObjects: [], failures: []};
+        const storedNames: string[] = [];
         try {
+            const {modelFiles, resourceFiles, unsupportedFiles} = groupDroppedFiles(files);
+            result.failures = unsupportedFiles.map((file) => ({fileName: file.name, reason: 'unsupported-format'}));
+
+            // A model finds its .bin, .mtl and textures here, by their lowercase names.
+            for (const file of [...modelFiles, ...resourceFiles]) {
+                const storedName = file.name.toLowerCase();
+                FilesInputStore.FilesToLoad[storedName] = file;
+                storedNames.push(storedName);
+            }
+
             for (const modelFile of modelFiles) {
                 const sceneObject = await this.loadModelFile(modelFile);
-                if (sceneObject) {
-                    result.sceneObjects.push(sceneObject);
-                } else {
+                if (!sceneObject) {
                     result.failures.push({fileName: modelFile.name, reason: 'unreadable'});
+                    continue;
                 }
+
+                result.sceneObjects.push(sceneObject);
+                // The object takes on the shading and the wireframe the viewport is in as soon as it is there.
+                this.setShadingMode(this.shadingMode);
+                this.setWireframeVisible(this.isWireframeVisible);
             }
 
             const lastObject = result.sceneObjects.at(-1);
             if (lastObject) {
-                // The new objects take on the shading and the wireframe the viewport is in.
-                this.setShadingMode(this.shadingMode);
-                this.setWireframeVisible(this.isWireframeVisible);
                 this.frameEntries([this.getEntry(lastObject.id)]);
             }
         } finally {
             for (const name of storedNames) {
                 delete FilesInputStore.FilesToLoad[name];
             }
-            finishImport();
+            finishOperation();
         }
 
         return result;
@@ -259,9 +295,9 @@ export class Viewport {
     public renameObject(objectId: string, name: string): string {
         const entry = this.getEntry(objectId);
         // The object's own name does not count as taken, so committing a name it already has changes nothing.
-        const otherNames = [...this.sceneEntries.values()].filter((other) => other !== entry).map((other) => other.name);
+        const otherEntries = [...this.sceneEntries.values()].filter((other) => other !== entry);
 
-        entry.name = createUniqueObjectName(name, otherNames);
+        entry.name = createUniqueObjectName(name, otherEntries.map((other) => other.name));
         entry.root.name = entry.name;
 
         return entry.name;
@@ -327,6 +363,66 @@ export class Viewport {
         return this.countMeshStats(entry.originalMeshes.filter((mesh) => mesh.isEnabled(false)));
     }
 
+    /**
+     * Writes an object as a GLB, in its own materials whatever the shading mode, without the wireframe overlays and
+     * even while its eye toggle is off. Of its nodes, only the enabled ones go in. The file keeps the object's place
+     * on the grid, centered with its base on it, which is the pivot games prefer. The viewport is left as it was.
+     * An export waits for the imports and exports asked for before it. One that has not finished after a minute is
+     * given up on: it rejects, and a result that comes in later is dropped.
+     */
+    public async exportObjectAsGlb(objectId: string): Promise<Blob> {
+        const {name, root, originalMeshes} = this.getEntry(objectId);
+        const finishOperation = await this.takeTurn();
+
+        const overlays = originalMeshes
+            .map((mesh) => this.wireframeOverlays.get(mesh))
+            .filter((overlay) => overlay !== undefined);
+        const wasRootEnabled = root.isEnabled(false);
+        let timer: ReturnType<typeof setTimeout> | undefined;
+
+        this.isExporting = true;
+        try {
+            // Undoes what the viewport does to how an object looks: the eye toggle, the clay and the overlays.
+            root.setEnabled(true);
+            for (const mesh of originalMeshes) {
+                mesh.material = this.originalMaterials.get(mesh) ?? null;
+            }
+            for (const overlay of overlays) {
+                overlay.setEnabled(false);
+            }
+
+            const exporting = GLTF2Export.GLBAsync(this.babylonScene, name, {
+                // Only the object's own nodes that are enabled, not the grid, the axes or the other objects.
+                shouldExportNode: (node) => node.isEnabled() && (node === root || node.isDescendantOf(root)),
+                // The root is what moves the model onto the grid. It is left out only where it moves nothing.
+                removeNoopRootNodes: true,
+                // A scene is ready once its shaders are compiled and its light is loaded, which the file does not
+                // need. The object's own textures were loaded when it was imported.
+                exportWithoutWaitingForScene: true,
+            });
+            const timeout = new Promise<never>((_resolve, reject) => {
+                timer = setTimeout(
+                    () => reject(new Error(`Exporting ${name} took longer than ${MODEL_EXPORT_TIMEOUT_MS / 1000} s.`)),
+                    MODEL_EXPORT_TIMEOUT_MS
+                );
+            });
+            const {files} = await Promise.race([exporting, timeout]);
+            const [glb] = Object.values(files);
+
+            return glb as Blob;
+        } finally {
+            // Safe ahead of the restore, which is synchronous; a throw in it then blocks nothing.
+            clearTimeout(timer);
+            this.isExporting = false;
+            finishOperation();
+
+            // The shading and the wireframe are given back the way the viewport is in them, as an import does.
+            root.setEnabled(wasRootEnabled);
+            this.setShadingMode(this.shadingMode);
+            this.setWireframeVisible(this.isWireframeVisible);
+        }
+    }
+
     /** @internal For hulma-core's own services and specs, not for the client. */
     public get scene(): Scene {
         return this.babylonScene;
@@ -388,12 +484,16 @@ export class Viewport {
             false,
             true
         );
+        this.babylonScene.environmentIntensity = ENVIRONMENT_INTENSITY;
 
         const fillLight = new HemisphericLight('fill-light', Vector3.Up(), this.babylonScene);
-        fillLight.intensity = 0.4;
+        fillLight.intensity = FILL_LIGHT_INTENSITY;
 
-        const keyLight = new DirectionalLight('key-light', new Vector3(-0.5, -1, -0.4), this.babylonScene);
-        keyLight.intensity = 0.8;
+        // Hung from the camera, the key light keeps its place in the view while the camera orbits.
+        const {x, y, z} = KEY_LIGHT_DIRECTION;
+        const keyLight = new DirectionalLight('key-light', new Vector3(x, y, z), this.babylonScene);
+        keyLight.parent = this.babylonCamera;
+        keyLight.intensity = KEY_LIGHT_INTENSITY;
     }
 
     private createModelStyles(): void {
@@ -401,9 +501,9 @@ export class Viewport {
         this.outlineLayer.outlineColor = Color3.FromHexString(SELECTION_OUTLINE_COLOR);
         this.outlineLayer.outlineThickness = 2;
 
-        // One grey clay for every object in solid mode.
+        // One grey clay for every object in solid mode. PBR albedo is linear, so the hex color is converted to it.
         this.clayMaterial = new PBRMaterial('hulma-clay', this.babylonScene);
-        this.clayMaterial.albedoColor = Color3.FromHexString(CLAY_COLOR);
+        this.clayMaterial.albedoColor = Color3.FromHexString(CLAY_COLOR).toLinearSpace();
         this.clayMaterial.metallic = 0;
         this.clayMaterial.roughness = 0.65;
 
@@ -416,78 +516,130 @@ export class Viewport {
         this.wireframeMaterial.zOffset = -1;
     }
 
-    // Resolves to null when the file holds no model: a damaged file, a missing .bin, or nothing made of triangles.
-    private async loadModelFile(file: File): Promise<ISceneObject | null> {
-        const container = await LoadAssetContainerAsync(file, this.babylonScene, {
+    // Takes the next turn of the imports and exports: resolves once the earlier ones are done, to the function that
+    // hands the turn on.
+    private async takeTurn(): Promise<() => void> {
+        const earlierOperation = this.lastOperation;
+        let finishOperation = (): void => undefined;
+        this.lastOperation = new Promise<void>((resolve) => {
+            finishOperation = resolve;
+        });
+        await earlierOperation;
+
+        return finishOperation;
+    }
+
+    // Resolves to null when Babylon cannot read the file, or does not settle in time.
+    private async loadContainer(file: File): Promise<AssetContainer | null> {
+        const load = LoadAssetContainerAsync(file, this.babylonScene, {
             rootUrl: 'file:',
-            // A splat file must not retune our camera's limits.
-            pluginOptions: {splat: {disableAutoCameraLimits: true}},
-        }).catch(() => null);
+            pluginOptions: {
+                // A splat file must not retune our camera's limits.
+                splat: {disableAutoCameraLimits: true},
+                // An .obj comes back with its textures still loading, which would list them as 0 by 0.
+                obj: {waitForTextures: true},
+            },
+        });
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const timeout = new Promise<null>((resolve) => {
+            timer = setTimeout(() => resolve(null), MODEL_LOAD_TIMEOUT_MS);
+        });
+
+        const container = await Promise.race([load.catch(() => null), timeout]);
+        clearTimeout(timer);
+        if (!container) {
+            // A load that gave up may still finish some day: what it brings is thrown away, and never shown.
+            load.then((lateContainer) => lateContainer.dispose(), () => undefined);
+        }
+
+        return container;
+    }
+
+    // Resolves to null when the file holds no model: a damaged file, a missing .bin, nothing made of triangles, or a
+    // load that never settles.
+    private async loadModelFile(file: File): Promise<ISceneObject | null> {
+        // Babylon decodes every .ply as little-endian binary, and hangs or misparses a file in any other format. A file
+        // that cannot be read gives an empty header, which is refused like any other that is not little-endian.
+        const isPly = getFileExtension(file.name) === 'ply';
+        if (isPly && !isLittleEndianPlyHeader(await file.slice(0, PLY_HEADER_BYTE_COUNT).text().catch(() => ''))) {
+            return null;
+        }
+
+        const container = await this.loadContainer(file);
         if (!container) {
             return null;
         }
 
-        // A model is made of triangles. A point cloud has none, and a Gaussian splat is drawn as splats, not as a mesh.
-        const meshes = container.meshes.filter(
-            (mesh) => mesh.getTotalVertices() > 0 && !mesh.getClassName().startsWith('GaussianSplatting')
-        );
-        const stats = this.countMeshStats(meshes);
-        if (stats.triangleCount === 0) {
-            container.dispose();
-            return null;
-        }
-
-        container.addAllToScene();
-        const name = createUniqueObjectName(
-            getObjectNameFromFileName(file.name),
-            [...this.sceneEntries.values()].map((entry) => entry.name)
-        );
-        const root = new TransformNode(name, this.babylonScene);
-        for (const node of container.rootNodes) {
-            node.parent = root;
-        }
-
-        // The model sits centered on x and z, with its base on the grid. The meshes' world bounds are read from fresh
-        // world matrices, and are refreshed again after the move. A forced update brings the parents up to date too.
-        const refreshWorldBounds = (): void => {
-            for (const mesh of meshes) {
-                mesh.computeWorldMatrix(true);
+        let root: TransformNode | undefined;
+        try {
+            // A model is made of triangles. A point cloud has none, and a Gaussian splat is drawn as splats instead.
+            const meshes = container.meshes.filter(
+                (mesh) => mesh.getTotalVertices() > 0 && !mesh.getClassName().startsWith('GaussianSplatting')
+            );
+            const stats = this.countMeshStats(meshes);
+            if (stats.triangleCount === 0) {
+                container.dispose();
+                return null;
             }
-        };
-        refreshWorldBounds();
-        const {min, max} = Mesh.MinMax(meshes);
-        const bounds = {minimum: min, maximum: max};
-        const offset = getGroundingOffset(bounds);
-        root.position.set(offset.x, offset.y, offset.z);
-        refreshWorldBounds();
 
-        const id = `object-${++this.objectCounter}`;
-        this.sceneEntries.set(id, {id, name, fileName: file.name, root, originalMeshes: meshes});
-        for (const mesh of meshes) {
-            this.originalMaterials.set(mesh, mesh.material);
-        }
+            container.addAllToScene();
+            const name = createUniqueObjectName(
+                getObjectNameFromFileName(file.name),
+                [...this.sceneEntries.values()].map((entry) => entry.name)
+            );
+            root = new TransformNode(name, this.babylonScene);
+            for (const node of container.rootNodes) {
+                node.parent = root;
+            }
 
-        // Each texture once, even where several slots or materials share it. A multi-material lists its
-        // sub-materials' textures too. The original materials are the source, whatever the shading is right now.
-        const textures = new Map<object, ITextureInfo>();
-        for (const mesh of meshes) {
-            for (const texture of this.originalMaterials.get(mesh)?.getActiveTextures() ?? []) {
-                const textureKey = texture.getInternalTexture() ?? texture;
-                if (!textures.has(textureKey)) {
-                    const {width, height} = texture.getSize();
-                    textures.set(textureKey, {name: texture.name, width, height});
+            // The model sits centered on x and z, with its base on the grid. The meshes' world bounds are read from
+            // fresh world matrices, and refreshed again after the move. A forced update brings the parents up to date.
+            const refreshWorldBounds = (): void => {
+                for (const mesh of meshes) {
+                    mesh.computeWorldMatrix(true);
+                }
+            };
+            refreshWorldBounds();
+            const {min, max} = Mesh.MinMax(meshes);
+            const bounds = {minimum: min, maximum: max};
+            const offset = getGroundingOffset(bounds);
+            root.position.set(offset.x, offset.y, offset.z);
+            refreshWorldBounds();
+
+            // Each texture once, even where several slots or materials share it. A multi-material lists its
+            // sub-materials' textures too. The meshes still carry their own materials: clay is only put on later.
+            const textures = new Map<object, ITextureInfo>();
+            for (const mesh of meshes) {
+                for (const texture of mesh.material?.getActiveTextures() ?? []) {
+                    const textureKey = texture.getInternalTexture() ?? texture;
+                    if (!textures.has(textureKey)) {
+                        const {width, height} = texture.getSize();
+                        textures.set(textureKey, {name: texture.name, width, height});
+                    }
                 }
             }
-        }
 
-        return {
-            id,
-            name,
-            fileName: file.name,
-            dimensions: getBoundsSize(bounds),
-            stats,
-            textures: [...textures.values()],
-        };
+            // Registered last, so that a failure above never leaves the object half in place.
+            const id = `object-${++this.objectCounter}`;
+            this.sceneEntries.set(id, {id, name, fileName: file.name, root, originalMeshes: meshes});
+            for (const mesh of meshes) {
+                this.originalMaterials.set(mesh, mesh.material);
+            }
+
+            return {
+                id,
+                name,
+                fileName: file.name,
+                dimensions: getBoundsSize(bounds),
+                stats,
+                textures: [...textures.values()],
+            };
+        } catch {
+            container.dispose();
+            root?.dispose();
+
+            return null;
+        }
     }
 
     private countMeshStats(meshes: AbstractMesh[]): IMeshStats {
@@ -516,15 +668,6 @@ export class Viewport {
         }
 
         return entry;
-    }
-
-    private frameSelection(): void {
-        // Like Blender's Home, with nothing selected it frames everything that is shown.
-        const entries = this.selectedEntry
-            ? [this.selectedEntry]
-            : [...this.sceneEntries.values()].filter((entry) => entry.root.isEnabled());
-
-        this.frameEntries(entries);
     }
 
     private frameEntries(entries: ISceneEntry[]): void {
