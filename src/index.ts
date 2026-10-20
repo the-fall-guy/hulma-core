@@ -15,3 +15,6 @@ export {
     getVectorLength,
     normalizeVector
 } from '@core/math/utilities/vector.utility';
+export type {IViewportOptions} from '@core/viewport/interfaces/viewport-options.interface';
+export type {TShadingMode} from '@core/viewport/interfaces/shading-mode.interface';
+export {Viewport} from '@core/viewport/services/viewport.service';

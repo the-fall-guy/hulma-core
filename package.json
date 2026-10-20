@@ -22,7 +22,20 @@
         "copy": "node scripts/copy-to-client.mjs",
         "test": "vitest run"
     },
+    "peerDependencies": {
+        "@babylonjs/core": "~9.31.0",
+        "@babylonjs/loaders": "~9.31.0",
+        "@babylonjs/materials": "~9.31.0",
+        "@babylonjs/serializers": "~9.31.0",
+        "babylonjs-gltf2interface": "~9.31.0"
+    },
     "devDependencies": {
+        "@babylonjs/core": "~9.31.0",
+        "@babylonjs/loaders": "~9.31.0",
+        "@babylonjs/materials": "~9.31.0",
+        "@babylonjs/serializers": "~9.31.0",
+        "babylonjs-gltf2interface": "~9.31.0",
+        "happy-dom": "~21.0.3",
         "tsdown": "~0.23.1",
         "typescript": "~6.0.2",
         "vite": "~8.3.4",
